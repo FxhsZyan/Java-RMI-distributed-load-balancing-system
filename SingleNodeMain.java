@@ -2,79 +2,68 @@ package loadbalancer;
 
 import java.rmi.Naming;
 import java.rmi.registry.LocateRegistry;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
 /**
  * ═══════════════════════════════════════════════════════════════════
- *  SINGLE-NODE LAUNCHER — for deploying one node per machine on a LAN
+ *  SINGLE-NODE LAUNCHER — one node per physical machine on a LAN
  * ═══════════════════════════════════════════════════════════════════
  *
  * Usage:
- *   java -cp dist/DistributedLoadBalancer.jar loadbalancer.SingleNodeMain \
- *        <nodeId> <port> <peer1addr> [<peer2addr> ...]
+ *   java -cp DistributedLoadBalancer.jar loadbalancer.SingleNodeMain \
+ *        <nodeId> <port> [peerAddr1] [peerAddr2] …
  *
- * Example (Machine A — Node-1 at port 1100):
- *   java ... loadbalancer.SingleNodeMain Node-1 1100 \
- *        rmi://192.168.1.11:1101/Node-2 rmi://192.168.1.12:1102/Node-3
+ * Machine A (192.168.1.10):
+ *   java … SingleNodeMain Node-1 1100 \
+ *       rmi://192.168.1.11:1101/Node-2 rmi://192.168.1.12:1102/Node-3
  *
- * Example (Machine B — Node-2 at port 1101):
- *   java ... loadbalancer.SingleNodeMain Node-2 1101 \
- *        rmi://192.168.1.10:1100/Node-1 rmi://192.168.1.12:1102/Node-3
+ * Machine B (192.168.1.11):
+ *   java … SingleNodeMain Node-2 1101 \
+ *       rmi://192.168.1.10:1100/Node-1 rmi://192.168.1.12:1102/Node-3
  *
- * ─── IMPORTANT: Run on every machine separately ───────────────────
- * Start peers first, then give each node the addresses of the others.
- * The node will print its own RMI address so you can copy it into the
- * peer list of the other nodes.
+ * IMPORTANT: add -Djava.rmi.server.hostname=<this-machine-IP> so RMI
+ * advertises the correct address to other machines.
  */
 public class SingleNodeMain {
 
     public static void main(String[] args) throws Exception {
         if (args.length < 2) {
-            System.err.println("Usage: SingleNodeMain <nodeId> <port> [peer1addr] [peer2addr] ...");
+            System.err.println("Usage: SingleNodeMain <nodeId> <port> [peerAddr…]");
             System.exit(1);
         }
 
-        String nodeId = args[0];
-        int    port   = Integer.parseInt(args[1]);
-
-        // Collect peer addresses from remaining arguments
-        List<String> peers = Arrays.asList(Arrays.copyOfRange(args, 2, args.length));
+        String       nodeId = args[0];
+        int          port   = Integer.parseInt(args[1]);
+        List<String> peers  = new ArrayList<>(
+                Arrays.asList(Arrays.copyOfRange(args, 2, args.length)));
 
         String selfAddr = "rmi://localhost:" + port + "/" + nodeId;
 
-        System.out.println("╔══════════════════════════════════════════╗");
-        System.out.println("║  Single-Node Launcher  (Java RMI)        ║");
-        System.out.println("╚══════════════════════════════════════════╝");
-        System.out.println("Node ID  : " + nodeId);
-        System.out.println("Port     : " + port);
-        System.out.println("Address  : " + selfAddr);
-        System.out.println("Peers    : " + (peers.isEmpty() ? "(none yet)" : peers));
-        System.out.println();
+        System.out.printf("Starting %s on port %d  peers=%s%n", nodeId, port, peers);
 
-        // Start the RMI registry on the specified port
         LocateRegistry.createRegistry(port);
-
-        // Create and export the node
         NodeImpl node = new NodeImpl(nodeId);
         Naming.rebind(selfAddr, node);
 
-        if (!peers.isEmpty()) {
-            node.registerPeers(peers);
-        }
+        if (!peers.isEmpty()) node.registerPeers(peers);
 
-        // Start a local task generator that submits tasks to itself
-        // In production you would also target the peers once they are up
         NodeInterface selfStub = (NodeInterface) Naming.lookup(selfAddr);
-        TaskGenerator gen = new TaskGenerator(nodeId, new java.util.ArrayList<>(List.of(selfStub)));
+        TaskGenerator gen = new TaskGenerator(nodeId, new ArrayList<>(List.of(selfStub)));
         gen.start();
+
+        Monitor monitor = new Monitor(new ArrayList<>(List.of(selfStub)));
+        monitor.start();
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             gen.stop();
+            monitor.stop();
             node.shutdown();
+            try { Naming.unbind(selfAddr); } catch (Exception ignored) {}
         }));
 
-        System.out.println("Node running. Press Ctrl+C to stop.");
+        System.out.println("Running. Ctrl+C to stop.");
         Thread.currentThread().join();
     }
 }

@@ -4,27 +4,31 @@ import java.rmi.RemoteException;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 
 /**
- * Periodically polls all nodes and prints a live dashboard to the console.
+ * Prints a rich dashboard to the console every INTERVAL_SECONDS.
  *
  * Example output:
- * ══════════════════════════════════════════════
- *  Cluster Status  [12:34:56]
- * ══════════════════════════════════════════════
- *  Node-1   | load= 75% | active= 3 | done= 42 | fwd= 5
- *  Node-2   | load= 25% | active= 1 | done= 38 | fwd= 2
- *  Node-3   | load=  0% | active= 0 | done= 31 | fwd= 0
- * ══════════════════════════════════════════════
+ * ════════════════════════════════════════════════════════════════════════
+ *  CLUSTER DASHBOARD  [12:34:56]   nodes=3   total-completed=127
+ * ════════════════════════════════════════════════════════════════════════
+ *  Node-1  | load= 83% [5/6] |████████░░| done= 48 | fwd-out= 12 | fwd-in=  3
+ *  Node-2  | load= 50% [3/6] |█████░░░░░| done= 43 | fwd-out=  4 | fwd-in=  9
+ *  Node-3  | load= 17% [1/6] |██░░░░░░░░| done= 36 | fwd-out=  1 | fwd-in=  7
+ * ────────────────────────────────────────────────────────────────────────
+ *  LOAD BALANCE PROOF: tasks have been redistributed between nodes ✔
+ * ════════════════════════════════════════════════════════════════════════
  */
 public class Monitor {
 
+    private static final int INTERVAL_SECONDS = 4;
+    private static final DateTimeFormatter TS =
+            DateTimeFormatter.ofPattern("HH:mm:ss");
+    private static final int BAR_WIDTH = 10;
+
     private final List<NodeInterface>      nodes;
     private final ScheduledExecutorService scheduler;
-    private static final int INTERVAL_SECONDS = 5;
 
     public Monitor(List<NodeInterface> nodes) {
         this.nodes     = nodes;
@@ -36,44 +40,66 @@ public class Monitor {
     }
 
     public void start() {
-        scheduler.scheduleAtFixedRate(this::printDashboard,
+        scheduler.scheduleAtFixedRate(this::print,
                 INTERVAL_SECONDS, INTERVAL_SECONDS, TimeUnit.SECONDS);
-        System.out.println("[Monitor] Dashboard polling every " + INTERVAL_SECONDS + "s");
+        System.out.println("[Monitor] Dashboard every " + INTERVAL_SECONDS + "s");
     }
 
-    private void printDashboard() {
-        String time = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
-        System.out.println();
-        System.out.println("══════════════════════════════════════════════════");
-        System.out.printf ("  Cluster Status  [%s]%n", time);
-        System.out.println("══════════════════════════════════════════════════");
+    private void print() {
+        String time = LocalTime.now().format(TS);
+        int totalDone = 0;
+        int totalFwd  = 0;
+        int totalRcv  = 0;
 
-        for (NodeInterface node : nodes) {
+        // ── Collect status from all nodes ────────────────────────────────────
+        NodeStatus[] statuses = new NodeStatus[nodes.size()];
+        for (int i = 0; i < nodes.size(); i++) {
             try {
-                NodeStatus s = node.getStatus();
-                // Visual load bar (10 chars wide)
-                String bar = loadBar(s.getLoad(), 10);
-                System.out.printf("  %s  [%s]%n", s, bar);
+                statuses[i] = nodes.get(i).getStatus();
+                totalDone  += statuses[i].getCompletedTasks();
+                totalFwd   += statuses[i].getForwardedTasks();
+                totalRcv   += statuses[i].getReceivedTasks();
             } catch (RemoteException e) {
-                System.out.println("  ??? (node unreachable: " + e.getMessage() + ")");
+                // node offline — leave null
             }
         }
 
-        System.out.println("══════════════════════════════════════════════════");
+        // ── Print dashboard ──────────────────────────────────────────────────
+        String sep  = "═".repeat(76);
+        String thin = "─".repeat(76);
+        System.out.println();
+        System.out.println(sep);
+        System.out.printf("  CLUSTER DASHBOARD  [%s]   nodes=%d   total-completed=%d%n",
+                time, nodes.size(), totalDone);
+        System.out.println(sep);
+
+        for (NodeStatus s : statuses) {
+            if (s == null) {
+                System.out.println("  ??? — node unreachable");
+                continue;
+            }
+            String bar = bar(s.getLoad(), BAR_WIDTH);
+            System.out.printf("  %s  |%s|%n", s, bar);
+        }
+
+        System.out.println(thin);
+
+        // ── Load-balancing proof line ────────────────────────────────────────
+        if (totalFwd > 0) {
+            System.out.printf("  ✔  LOAD BALANCING ACTIVE: %d task(s) forwarded across nodes%n",
+                    totalFwd);
+        } else {
+            System.out.println("  ⏳ Load balancing not yet triggered (nodes not overloaded)");
+        }
+        System.out.println(sep);
     }
 
-    /** Returns a simple ASCII bar like [████░░░░░░] */
-    private static String loadBar(double load, int width) {
+    private static String bar(double load, int width) {
         int filled = (int) Math.round(load * width);
-        StringBuilder sb = new StringBuilder("[");
-        for (int i = 0; i < width; i++) {
-            sb.append(i < filled ? '█' : '░');
-        }
-        sb.append(']');
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < width; i++) sb.append(i < filled ? '█' : '░');
         return sb.toString();
     }
 
-    public void stop() {
-        scheduler.shutdownNow();
-    }
+    public void stop() { scheduler.shutdownNow(); }
 }

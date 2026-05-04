@@ -1,118 +1,118 @@
 package loadbalancer;
 
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.List;
 import java.util.Random;
 
 /**
- * Executes CPU-intensive tasks in dedicated threads.
- * Each of the three task types genuinely stresses the CPU so the load
- * simulation is realistic rather than just Thread.sleep().
+ * Executes CPU-intensive workloads in worker threads.
+ *
+ * Every computation is deliberately heavy:
+ *   PRIME_SEARCH    — sieve up to ~5 M     → ~50–200 ms on modern hardware
+ *   MATRIX_MULTIPLY — N=350–500 matrices   → ~200–800 ms  (O(N³))
+ *   SORT_ARRAY      — 5–15 million ints    → ~500–1500 ms
+ *
+ * Tasks are looped internally so each call burns at least MIN_BURN_MS of
+ * wall-clock time, making CPU usage clearly visible in Task Manager / top.
  */
 public class TaskProcessor {
 
-    /**
-     * Dispatch the task to the appropriate computation method.
-     * Called inside a thread-pool worker so it is safe to block here.
-     */
+    /** Minimum time each task should burn (milliseconds). */
+    private static final long MIN_BURN_MS = 800;
+
+    // ── Public dispatch ───────────────────────────────────────────────────────
+
     public static String process(Task task) {
         long start = System.currentTimeMillis();
         String result;
 
         switch (task.getType()) {
-            case PRIME_SEARCH:
-                result = findPrimes(task.getParameter());
-                break;
-            case MATRIX_MULTIPLY:
-                result = matrixMultiply(task.getParameter());
-                break;
-            case SORT_ARRAY:
-                result = sortArray(task.getParameter());
-                break;
-            default:
-                result = "Unknown task type";
+            case PRIME_SEARCH:      result = findPrimesLooped(task.getParameter(), start); break;
+            case MATRIX_MULTIPLY:   result = matrixMultiplyLooped(task.getParameter(), start); break;
+            case SORT_ARRAY:        result = sortArrayLooped(task.getParameter(), start); break;
+            default:                result = "Unknown task type";
         }
 
         long elapsed = System.currentTimeMillis() - start;
-        return String.format("[%s] %s completed in %d ms — %s",
+        return String.format("[%s] %s — %d ms — %s",
                 task.getTaskId(), task.getType(), elapsed, result);
     }
 
-    // ── Prime Number Search (Sieve of Eratosthenes) ──────────────────────────
+    // ── Prime Search (Sieve of Eratosthenes) ─────────────────────────────────
 
-    /**
-     * Finds all prime numbers up to 'limit' using a sieve.
-     * For large limits (>500 000) this takes a noticeable amount of CPU time.
-     */
-    private static String findPrimes(int limit) {
-        boolean[] sieve = new boolean[limit + 1];
-        Arrays.fill(sieve, true);
-        sieve[0] = sieve[1] = false;
-
-        for (int i = 2; (long) i * i <= limit; i++) {
-            if (sieve[i]) {
-                for (int j = i * i; j <= limit; j += i) {
-                    sieve[j] = false;
-                }
-            }
-        }
-
-        int count = 0;
+    private static String findPrimesLooped(int limit, long startMs) {
+        int rounds = 0;
+        int count  = 0;
         int largest = 2;
-        for (int i = 2; i <= limit; i++) {
-            if (sieve[i]) { count++; largest = i; }
-        }
-        return String.format("%d primes up to %d (largest: %d)", count, limit, largest);
-    }
 
-    // ── Matrix Multiplication ─────────────────────────────────────────────────
-
-    /**
-     * Multiplies two randomly-initialized N×N matrices.
-     * Complexity is O(N³), so even N=200 creates a real workload.
-     */
-    private static String matrixMultiply(int n) {
-        Random rng = new Random(42);
-        double[][] a = new double[n][n];
-        double[][] b = new double[n][n];
-        double[][] c = new double[n][n];
-
-        // Initialize with random values
-        for (int i = 0; i < n; i++) {
-            for (int j = 0; j < n; j++) {
-                a[i][j] = rng.nextDouble() * 100;
-                b[i][j] = rng.nextDouble() * 100;
-            }
-        }
-
-        // Standard triple-loop multiply
-        for (int i = 0; i < n; i++) {
-            for (int k = 0; k < n; k++) {
-                for (int j = 0; j < n; j++) {
-                    c[i][j] += a[i][k] * b[k][j];
+        do {
+            boolean[] sieve = new boolean[limit + 1];
+            Arrays.fill(sieve, true);
+            sieve[0] = sieve[1] = false;
+            for (int i = 2; (long)i * i <= limit; i++) {
+                if (sieve[i]) {
+                    for (int j = i * i; j <= limit; j += i) sieve[j] = false;
                 }
             }
-        }
+            count = 0; largest = 2;
+            for (int i = 2; i <= limit; i++) {
+                if (sieve[i]) { count++; largest = i; }
+            }
+            rounds++;
+        } while (System.currentTimeMillis() - startMs < MIN_BURN_MS);
 
-        // Use a corner element so the JIT won't eliminate dead code
-        return String.format("%dx%d matrix multiplied, C[0][0]=%.2f", n, n, c[0][0]);
+        return String.format("%d primes ≤ %,d (largest %,d) × %d rounds",
+                count, limit, largest, rounds);
     }
 
-    // ── Large Array Sort ──────────────────────────────────────────────────────
+    // ── Matrix Multiplication (O(N³)) ────────────────────────────────────────
 
-    /**
-     * Generates and sorts an array of 'size' random integers.
-     * Uses Arrays.sort (dual-pivot quicksort) on sizes up to several million.
-     */
-    private static String sortArray(int size) {
+    private static String matrixMultiplyLooped(int n, long startMs) {
+        Random rng = new Random(42);
+        int rounds = 0;
+        double corner = 0;
+
+        do {
+            double[][] a = new double[n][n];
+            double[][] b = new double[n][n];
+            double[][] c = new double[n][n];
+            for (int i = 0; i < n; i++) {
+                for (int j = 0; j < n; j++) {
+                    a[i][j] = rng.nextDouble() * 100;
+                    b[i][j] = rng.nextDouble() * 100;
+                }
+            }
+            // ikj loop order — cache-friendly
+            for (int i = 0; i < n; i++) {
+                for (int k = 0; k < n; k++) {
+                    for (int j = 0; j < n; j++) {
+                        c[i][j] += a[i][k] * b[k][j];
+                    }
+                }
+            }
+            corner = c[0][0];
+            rounds++;
+        } while (System.currentTimeMillis() - startMs < MIN_BURN_MS);
+
+        return String.format("%dx%d matrix, C[0][0]=%.1f × %d rounds", n, n, corner, rounds);
+    }
+
+    // ── Array Sort ────────────────────────────────────────────────────────────
+
+    private static String sortArrayLooped(int size, long startMs) {
         Random rng = new Random(99);
-        int[] arr = new int[size];
-        for (int i = 0; i < size; i++) {
-            arr[i] = rng.nextInt(Integer.MAX_VALUE);
-        }
-        Arrays.sort(arr);
-        return String.format("Sorted %d elements, min=%d max=%d",
-                size, arr[0], arr[arr.length - 1]);
+        int rounds = 0;
+        int min = 0, max = 0;
+
+        do {
+            int[] arr = new int[size];
+            for (int i = 0; i < size; i++) arr[i] = rng.nextInt(Integer.MAX_VALUE);
+            Arrays.sort(arr);
+            min = arr[0];
+            max = arr[arr.length - 1];
+            rounds++;
+        } while (System.currentTimeMillis() - startMs < MIN_BURN_MS);
+
+        return String.format("sorted %,d ints, min=%,d max=%,d × %d rounds",
+                size, min, max, rounds);
     }
 }

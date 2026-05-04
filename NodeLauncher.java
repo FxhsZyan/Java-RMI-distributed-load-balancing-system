@@ -2,62 +2,41 @@ package loadbalancer;
 
 import java.rmi.Naming;
 import java.rmi.registry.LocateRegistry;
-import java.rmi.registry.Registry;
 import java.util.ArrayList;
 import java.util.List;
 
 /**
  * ═══════════════════════════════════════════════════════════════════
- *  MAIN ENTRY POINT — starts the full distributed load-balancing cluster
+ *  MAIN ENTRY POINT — starts a full local cluster for testing
  * ═══════════════════════════════════════════════════════════════════
  *
- * Usage (run from the project root or via NetBeans Run menu):
+ * Run in NetBeans:
+ *   Right-click project → Properties → Run → Main Class: loadbalancer.NodeLauncher
+ *   Arguments field: 3        (or leave blank for default 3 nodes)
+ *   Then press F6.
  *
- *   java -cp dist/DistributedLoadBalancer.jar loadbalancer.NodeLauncher [numNodes]
+ * From the command line:
+ *   java -jar dist/DistributedLoadBalancer.jar [numNodes]
  *
- * Examples:
- *   java ... loadbalancer.NodeLauncher         → starts 3 nodes (default)
- *   java ... loadbalancer.NodeLauncher 5       → starts 5 nodes
+ * Ports: BASE_PORT, BASE_PORT+1, … (one per node, no conflicts)
  *
- * To simulate a multi-machine deployment on a LAN:
- *   • Run one JVM per node, passing a single nodeIndex argument (0-based).
- *   • Edit BASE_PORT and HOST to match your network configuration.
- *   • Each machine only starts the node for its own index.
- *   (See "Multi-Machine Instructions" at the bottom of this file.)
- *
- * Ports used: BASE_PORT, BASE_PORT+1, BASE_PORT+2, ...
- *   Each node gets its own RMI Registry on a unique port so they can
- *   all run on the same machine without conflict.
+ * If you get "Port already in use":
+ *   Windows → taskkill /F /IM java.exe
+ *   macOS   → killall java
  */
 public class NodeLauncher {
 
-    // ── Configuration ─────────────────────────────────────────────────────────
-
-    /** Change to the actual hostname/IP when running across machines */
     private static final String HOST      = "localhost";
-
-    /** First port; each additional node increments this by 1 */
     private static final int    BASE_PORT = 1100;
-
-    /** Default cluster size if no argument is given */
     private static final int    DEFAULT_NODES = 3;
-
-    // ── Main ──────────────────────────────────────────────────────────────────
 
     public static void main(String[] args) throws Exception {
 
-        int numNodes = DEFAULT_NODES;
-        if (args.length > 0) {
-            numNodes = Integer.parseInt(args[0]);
-        }
+        int numNodes = (args.length > 0) ? Integer.parseInt(args[0]) : DEFAULT_NODES;
 
-        System.out.println("╔═══════════════════════════════════════════╗");
-        System.out.println("║   Distributed Load Balancer  (Java RMI)   ║");
-        System.out.println("╚═══════════════════════════════════════════╝");
-        System.out.println("Starting " + numNodes + " node(s) on " + HOST + " ...");
-        System.out.println();
+        banner(numNodes);
 
-        // ── Step 1: Start one RMI registry per node and bind the NodeImpl ────
+        // ── 1. Boot one RMI registry + NodeImpl per node ─────────────────────
         List<NodeImpl>      nodeImpls = new ArrayList<>();
         List<NodeInterface> nodeStubs = new ArrayList<>();
         List<String>        allAddrs  = new ArrayList<>();
@@ -67,59 +46,74 @@ public class NodeLauncher {
             String nodeId = "Node-" + (i + 1);
             String addr   = "rmi://" + HOST + ":" + port + "/" + nodeId;
 
-            // Start a dedicated RMI registry on this port
-            Registry registry = LocateRegistry.createRegistry(port);
+            // Reuse existing registry if port is already bound (safe restart)
+            try {
+                LocateRegistry.createRegistry(port);
+            } catch (java.rmi.server.ExportException e) {
+                System.out.println("  [warn] Port " + port + " reusing existing registry");
+                LocateRegistry.getRegistry(HOST, port);
+            }
 
-            // Create and export the node
             NodeImpl node = new NodeImpl(nodeId);
             Naming.rebind(addr, node);
-
             nodeImpls.add(node);
             allAddrs.add(addr);
-            System.out.println("  ✔ Bound " + nodeId + " at " + addr);
+            System.out.println("  ✔  " + nodeId + " bound at " + addr);
         }
 
-        // ── Step 2: Give every node the addresses of its peers ───────────────
-        // Each node gets all addresses EXCEPT its own
+        // ── 2. Exchange peer lists ────────────────────────────────────────────
         for (int i = 0; i < numNodes; i++) {
             List<String> peers = new ArrayList<>(allAddrs);
-            peers.remove(allAddrs.get(i)); // remove self
+            peers.remove(allAddrs.get(i));
             nodeImpls.get(i).registerPeers(peers);
         }
 
-        // ── Step 3: Retrieve remote stubs for the monitor & task generator ────
+        // ── 3. Lookup stubs for monitor + generators ──────────────────────────
         for (String addr : allAddrs) {
             nodeStubs.add((NodeInterface) Naming.lookup(addr));
         }
 
-        // ── Step 4: Start the live dashboard ─────────────────────────────────
+        // ── 4. Live dashboard ─────────────────────────────────────────────────
         Monitor monitor = new Monitor(nodeStubs);
         monitor.start();
 
-        // ── Step 5: Start task generators (one per node, targeting all nodes) ─
-        // Each generator aims at the full node list to create cross-node traffic
+        // ── 5. Task generators — one per node, targeting all nodes ────────────
+        // Multiple generators + multiple sender threads per generator = high load
         List<TaskGenerator> generators = new ArrayList<>();
         for (int i = 0; i < numNodes; i++) {
-            // Give each generator a mutable copy so it can remove dead nodes
-            List<NodeInterface> targets = new ArrayList<>(nodeStubs);
-            TaskGenerator gen = new TaskGenerator("Gen-" + (i + 1), targets);
+            TaskGenerator gen = new TaskGenerator("G" + (i + 1),
+                    new ArrayList<>(nodeStubs));
             gen.start();
             generators.add(gen);
         }
 
-        // ── Step 6: Keep the JVM alive; register a shutdown hook ─────────────
+        // ── 6. Shutdown hook: unbind RMI names → ports freed immediately ──────
+        final List<String> boundAddrs = new ArrayList<>(allAddrs);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("\n[Launcher] Shutting down...");
+            System.out.println("\n[Launcher] Shutting down…");
             generators.forEach(TaskGenerator::stop);
             monitor.stop();
             nodeImpls.forEach(NodeImpl::shutdown);
+            boundAddrs.forEach(addr -> {
+                try { Naming.unbind(addr); } catch (Exception ignored) {}
+            });
+            System.out.println("[Launcher] Clean shutdown complete. Ports are free.");
         }));
 
         System.out.println();
-        System.out.println("Cluster is running. Press Ctrl+C to stop.");
+        System.out.println("  Cluster running. Watch the logs. Press Ctrl+C to stop.");
         System.out.println();
 
-        // Block the main thread forever
         Thread.currentThread().join();
+    }
+
+    private static void banner(int n) {
+        System.out.println();
+        System.out.println("╔══════════════════════════════════════════════════════╗");
+        System.out.println("║   Distributed Load Balancer  ·  Java RMI             ║");
+        System.out.println("║   Nodes: " + n + "  ·  Threads/node: " + NodeImpl.MAX_THREADS
+                + "  ·  Overload @ 67%              ║");
+        System.out.println("╚══════════════════════════════════════════════════════╝");
+        System.out.println();
     }
 }

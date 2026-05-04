@@ -2,109 +2,142 @@ package loadbalancer;
 
 import java.rmi.RemoteException;
 import java.rmi.server.UnicastRemoteObject;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Concrete implementation of a distributed node.
+ * ═══════════════════════════════════════════════════════════════
+ *  NodeImpl — the heart of the distributed load balancing system
+ * ═══════════════════════════════════════════════════════════════
  *
  * Each node is simultaneously:
- *   • An RMI server  — accepts tasks from other nodes or the task generator
- *   • A load balancer — forwards overflow tasks to the least-loaded peer
- *   • A task generator — periodically creates its own work
+ *  • An RMI SERVER   — accepts tasks from generators and other nodes
+ *  • A LOAD BALANCER — forwards overflow tasks to the least-loaded peer
  *
- * Architecture decisions:
- *   • Thread pool size = MAX_THREADS limits concurrency and provides backpressure
- *   • Load is reported as activeTasks / MAX_THREADS (capped at 1.0)
- *   • Tasks are forwarded when load > OVERLOAD_THRESHOLD
- *   • If all peers are also overloaded, the task is queued locally anyway
- *     (no tasks are dropped — fault tolerance for overload)
+ * Load balancing logic
+ * ────────────────────
+ *  • activeTasks / MAX_THREADS = current load (0.0 – 1.0)
+ *  • If load ≥ OVERLOAD_THRESHOLD, find the peer with the lowest load
+ *  • If that peer is less loaded than us, forward the task to it
+ *  • If all peers are equally busy, process locally (no task is dropped)
+ *
+ * Fault tolerance
+ * ───────────────
+ *  • Live peer stubs are cached and refreshed every PEER_CACHE_TTL_MS
+ *  • Any peer that throws RemoteException is removed from the live list
+ *  • Tasks whose forward target dies mid-transfer are processed locally
  */
 public class NodeImpl extends UnicastRemoteObject implements NodeInterface {
 
     private static final long serialVersionUID = 1L;
 
-    // ── Configuration constants ───────────────────────────────────────────────
-    /** Max concurrent tasks before this node is considered "overloaded" */
-    private static final int    MAX_THREADS         = 4;
+    // ── Tunable constants ─────────────────────────────────────────────────────
 
-    /** Load fraction above which tasks get forwarded (0.75 = 75% busy) */
-    private static final double OVERLOAD_THRESHOLD  = 0.75;
+    /** Thread pool size — raise this to allow more concurrent tasks. */
+    static final int MAX_THREADS = 6;
 
-    /** How long a peer lookup is cached before re-checking liveness (ms) */
-    private static final long   PEER_CACHE_TTL_MS   = 5_000;
+    /**
+     * Load fraction (0–1) above which this node is considered overloaded
+     * and will attempt to forward new tasks to a less-busy peer.
+     * 0.67 = 4 of 6 threads busy → start offloading.
+     */
+    private static final double OVERLOAD_THRESHOLD = 0.67;
+
+    /** Milliseconds between live-peer cache refreshes. */
+    private static final long PEER_CACHE_TTL_MS = 4_000;
 
     // ── State ─────────────────────────────────────────────────────────────────
-    private final String           nodeId;
-    private final ExecutorService  pool;
-    private final AtomicInteger    activeTasks    = new AtomicInteger(0);
-    private final AtomicInteger    completedTasks = new AtomicInteger(0);
-    private final AtomicInteger    forwardedTasks = new AtomicInteger(0);
 
-    /** RMI binding addresses of peer nodes, e.g. "rmi://localhost:1200/Node-2" */
-    private final List<String>     peerAddresses  = new ArrayList<>();
+    private final String          nodeId;
+    private final ExecutorService pool;
 
-    /** Cached live peer stubs (refreshed every PEER_CACHE_TTL_MS) */
-    private final List<NodeInterface> livePeers   = new ArrayList<>();
-    private long   lastPeerRefresh = 0;
+    private final AtomicInteger activeTasks    = new AtomicInteger(0);
+    private final AtomicInteger completedTasks = new AtomicInteger(0);
+    private final AtomicInteger forwardedTasks = new AtomicInteger(0);
+    private final AtomicInteger receivedTasks  = new AtomicInteger(0);
+
+    private final List<String>        peerAddresses = new ArrayList<>();
+    private final List<NodeInterface> livePeers     = new ArrayList<>();
+    private       long                lastPeerRefresh = 0;
+
+    private static final DateTimeFormatter TS =
+            DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
     public NodeImpl(String nodeId) throws RemoteException {
-        super(); // exports this object so RMI can use it
+        super();
         this.nodeId = nodeId;
         this.pool   = Executors.newFixedThreadPool(MAX_THREADS, r -> {
             Thread t = new Thread(r, nodeId + "-Worker");
             t.setDaemon(true);
             return t;
         });
-        log("Node started (max threads: " + MAX_THREADS + ")");
+        log("STARTED", "thread pool size=" + MAX_THREADS
+                + "  overload threshold=" + (int)(OVERLOAD_THRESHOLD * 100) + "%");
     }
 
-    // ── NodeInterface implementation ──────────────────────────────────────────
+    // ── NodeInterface ─────────────────────────────────────────────────────────
 
     @Override
     public String submitTask(Task task) throws RemoteException {
         double load = getCurrentLoad();
 
-        // If we are overloaded, try to forward the task to a less-loaded peer
+        // ── Overload check: try to forward before accepting ──────────────────
         if (load >= OVERLOAD_THRESHOLD) {
-            NodeInterface target = findLeastLoadedPeer(this);
+            NodeInterface target = leastLoadedPeer();
             if (target != null) {
                 try {
-                    log(String.format("⇢ Forwarding %s (load=%.0f%%) → %s",
-                            task, load * 100, target.getNodeId()));
+                    double peerLoad = target.getCurrentLoad();
+                    String peerId   = target.getNodeId();
+                    log("OFFLOAD",
+                        String.format("%s  load=%.0f%%→forwarding to %s (load=%.0f%%)",
+                                task.getTaskId(), load * 100, peerId, peerLoad * 100));
                     forwardedTasks.incrementAndGet();
                     return target.submitTask(task);
                 } catch (RemoteException e) {
-                    // Peer died between discovery and forward — process locally
-                    log("Peer became unavailable during forward, processing locally: " + e.getMessage());
+                    log("WARN", "Forward failed, processing locally: " + e.getMessage());
                 }
+            } else {
+                log("OVERLOAD",
+                    String.format("%s  load=%.0f%% — all peers busy, processing locally",
+                            task.getTaskId(), load * 100));
             }
         }
 
-        // Process the task locally in the thread pool
-        activeTasks.incrementAndGet();
-        log(String.format("▶ Accepting %s (load=%.0f%%)", task, load * 100));
+        // ── Accept the task locally ──────────────────────────────────────────
+        boolean wasForwarded = !task.getOriginNodeId().equals(nodeId);
+        if (wasForwarded) receivedTasks.incrementAndGet();
 
-        // We submit to the pool and block until done (RMI call is synchronous)
+        activeTasks.incrementAndGet();
+        int active = activeTasks.get();
+        log("ACCEPT",
+            String.format("%s  active=%d/%d (%.0f%%)%s",
+                    task, active, MAX_THREADS, (double) active / MAX_THREADS * 100,
+                    wasForwarded ? "  ★RECEIVED FROM " + task.getOriginNodeId() : ""));
+
         try {
+            // Submit to thread pool and block the calling RMI thread
             String result = pool.submit(() -> {
                 try {
                     return TaskProcessor.process(task);
                 } finally {
-                    activeTasks.decrementAndGet();
+                    int remaining = activeTasks.decrementAndGet();
                     completedTasks.incrementAndGet();
+                    log("COMPLETE",
+                        String.format("%s  active now=%d/%d (%.0f%%)",
+                                task.getTaskId(), remaining, MAX_THREADS,
+                                (double) remaining / MAX_THREADS * 100));
                 }
-            }).get(); // .get() blocks the calling RMI thread until the task finishes
+            }).get(); // .get() blocks — keeps the RMI call synchronous
 
-            log("✔ Done: " + result);
             return result;
 
-        } catch (Exception e) {
+        } catch (ExecutionException | InterruptedException e) {
             activeTasks.decrementAndGet();
             throw new RemoteException("Task execution failed: " + e.getMessage(), e);
         }
@@ -116,113 +149,92 @@ public class NodeImpl extends UnicastRemoteObject implements NodeInterface {
     }
 
     @Override
-    public String getNodeId() throws RemoteException {
-        return nodeId;
-    }
+    public String getNodeId() throws RemoteException { return nodeId; }
 
     @Override
-    public int getActiveTaskCount() throws RemoteException {
-        return activeTasks.get();
-    }
+    public int getActiveTaskCount() throws RemoteException { return activeTasks.get(); }
 
     @Override
-    public boolean isAlive() throws RemoteException {
-        return true; // if we can call this, the node is alive
-    }
+    public boolean isAlive() throws RemoteException { return true; }
 
     @Override
     public NodeStatus getStatus() throws RemoteException {
-        return new NodeStatus(
-                nodeId,
-                getCurrentLoad(),
-                activeTasks.get(),
-                completedTasks.get(),
-                forwardedTasks.get()
-        );
+        return new NodeStatus(nodeId, getCurrentLoad(),
+                activeTasks.get(), completedTasks.get(),
+                forwardedTasks.get(), receivedTasks.get(), MAX_THREADS);
     }
 
     @Override
     public synchronized void registerPeers(List<String> addresses) throws RemoteException {
         peerAddresses.clear();
         peerAddresses.addAll(addresses);
-        livePeers.clear();      // force refresh on next task
+        livePeers.clear();
         lastPeerRefresh = 0;
-        log("Registered " + addresses.size() + " peer(s): " + addresses);
+        log("PEERS", "registered " + addresses.size() + " peer(s): " + addresses);
     }
 
-    // ── Load Balancing ────────────────────────────────────────────────────────
+    // ── Load balancing helpers ────────────────────────────────────────────────
 
     /**
-     * Returns the live peer with the lowest current load, or null if all peers
-     * are as loaded as (or more loaded than) this node.
-     *
-     * Also refreshes the live peer list when the cache TTL expires, removing
-     * any peers that no longer respond — this is the fault-tolerance mechanism.
+     * Returns the live peer with the lowest load that is actually less loaded
+     * than this node, or null if no such peer exists.
      */
-    private synchronized NodeInterface findLeastLoadedPeer(NodeImpl self) {
+    private synchronized NodeInterface leastLoadedPeer() {
         long now = System.currentTimeMillis();
-
-        // Refresh the live peer cache periodically
         if (now - lastPeerRefresh > PEER_CACHE_TTL_MS) {
             refreshLivePeers();
             lastPeerRefresh = now;
         }
 
-        NodeInterface best      = null;
-        double        bestLoad  = Double.MAX_VALUE;
+        NodeInterface best     = null;
+        double        bestLoad = Double.MAX_VALUE;
 
         for (NodeInterface peer : livePeers) {
             try {
-                double peerLoad = peer.getCurrentLoad();
-                if (peerLoad < bestLoad) {
-                    bestLoad = peerLoad;
-                    best     = peer;
-                }
+                double pl = peer.getCurrentLoad();
+                if (pl < bestLoad) { bestLoad = pl; best = peer; }
             } catch (RemoteException e) {
-                // Peer went offline; will be pruned on next refresh
-                log("Peer unreachable during load query: " + e.getMessage());
+                log("WARN", "Peer unreachable during load query: " + e.getMessage());
             }
         }
 
-        // Only forward if the best peer is actually less loaded than us
         try {
-            if (best != null && bestLoad < self.getCurrentLoad()) {
-                return best;
-            }
+            if (best != null && bestLoad < getCurrentLoad()) return best;
         } catch (RemoteException ignored) {}
 
         return null;
     }
 
-    /**
-     * Rebuilds the livePeers list by trying to look up each registered address.
-     * Peers that throw an exception are silently excluded (fault tolerance).
-     */
+    /** Rebuilds livePeers, silently dropping any that don't respond. */
     private void refreshLivePeers() {
         livePeers.clear();
         for (String addr : peerAddresses) {
             try {
-                NodeInterface peer = (NodeInterface) java.rmi.Naming.lookup(addr);
-                if (peer.isAlive()) {
-                    livePeers.add(peer);
-                }
+                NodeInterface p = (NodeInterface) java.rmi.Naming.lookup(addr);
+                if (p.isAlive()) livePeers.add(p);
             } catch (Exception e) {
-                log("⚠ Peer offline or unreachable: " + addr + " (" + e.getMessage() + ")");
+                log("PEER-DOWN", addr + " — " + e.getMessage());
             }
         }
-        log("Live peer count: " + livePeers.size() + "/" + peerAddresses.size());
+        if (!peerAddresses.isEmpty()) {
+            log("PEERS", "live=" + livePeers.size() + "/" + peerAddresses.size());
+        }
     }
 
     // ── Shutdown ──────────────────────────────────────────────────────────────
 
     public void shutdown() {
         pool.shutdownNow();
-        log("Node shutting down.");
+        log("STOPPED", "completed=" + completedTasks.get()
+                + "  forwarded=" + forwardedTasks.get()
+                + "  received=" + receivedTasks.get());
     }
 
     // ── Logging ───────────────────────────────────────────────────────────────
 
-    private void log(String msg) {
-        System.out.printf("[%s] %s%n", nodeId, msg);
+    /** Structured, timestamped log line for easy console reading. */
+    void log(String event, String detail) {
+        System.out.printf("[%s] %-8s %-10s %s%n",
+                LocalTime.now().format(TS), nodeId, event, detail);
     }
 }
