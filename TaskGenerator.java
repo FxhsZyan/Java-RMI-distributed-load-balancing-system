@@ -15,8 +15,8 @@ import java.util.concurrent.*;
  */
 public class TaskGenerator {
 
-    private static final int  SENDER_THREADS  = 3;
-    private static final int  SUBMIT_DELAY_MS = 300;
+    private static final int  SENDER_THREADS  = 3;  // was 3
+    private static final int  SUBMIT_DELAY_MS = 300; // was 300
 
     private final String                   genId;
     private final List<NodeInterface>      nodes;
