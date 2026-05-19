@@ -2,117 +2,104 @@ package loadbalancer;
 
 import java.util.Arrays;
 import java.util.Random;
+import java.util.concurrent.*;
 
 /**
- * Executes CPU-intensive workloads in worker threads.
+ * ═══════════════════════════════════════════════════════════════
+ *  TaskProcessor — deliberately heavy CPU workloads
+ * ═══════════════════════════════════════════════════════════════
  *
- * Every computation is deliberately heavy:
- *   PRIME_SEARCH    — sieve up to ~5 M     → ~50–200 ms on modern hardware
- *   MATRIX_MULTIPLY — N=350–500 matrices   → ~200–800 ms  (O(N³))
- *   SORT_ARRAY      — 5–15 million ints    → ~500–1500 ms
+ *  Every task loops until MIN_BURN_MS has elapsed so CPU usage
+ *  is clearly visible in Task Manager / top even on fast hardware.
  *
- * Tasks are looped internally so each call burns at least MIN_BURN_MS of
- * wall-clock time, making CPU usage clearly visible in Task Manager / top.
+ *  MATRIX_MULTIPLY  N=1200–1800  → several seconds per iteration
+ *  PRIME_SEARCH     up to 50M    → 1–3 s per sieve pass
+ *  SORT_ARRAY       10–20M ints  → 1–2 s per sort pass
  */
 public class TaskProcessor {
 
-    /** Minimum time each task should burn (milliseconds). */
-    private static final long MIN_BURN_MS = 800;
+    private static final long MIN_BURN_MS = ClusterConfig.MIN_BURN_MS;
 
     // ── Public dispatch ───────────────────────────────────────────────────────
 
     public static String process(Task task) {
         long start = System.currentTimeMillis();
-        String result;
+        String detail;
 
         switch (task.getType()) {
-            case PRIME_SEARCH:      result = findPrimesLooped(task.getParameter(), start); break;
-            case MATRIX_MULTIPLY:   result = matrixMultiplyLooped(task.getParameter(), start); break;
-            case SORT_ARRAY:        result = sortArrayLooped(task.getParameter(), start); break;
-            default:                result = "Unknown task type";
+            case MATRIX_MULTIPLY: detail = matrixLoop(task.getParameter(), start); break;
+            case PRIME_SEARCH:    detail = primeLoop(task.getParameter(), start);  break;
+            case SORT_ARRAY:      detail = sortLoop(task.getParameter(), start);   break;
+            default:              detail = "unknown type";
         }
 
-        long elapsed = System.currentTimeMillis() - start;
-        return String.format("[%s] %s — %d ms — %s",
-                task.getTaskId(), task.getType(), elapsed, result);
+        long ms = System.currentTimeMillis() - start;
+        return String.format("[%s] %s %d ms — %s",
+                task.getTaskId(), task.getType(), ms, detail);
     }
 
-    // ── Prime Search (Sieve of Eratosthenes) ─────────────────────────────────
+    // ── Matrix multiply (O(N³)) ───────────────────────────────────────────────
 
-    private static String findPrimesLooped(int limit, long startMs) {
-        int rounds = 0;
-        int count  = 0;
-        int largest = 2;
-
-        do {
-            boolean[] sieve = new boolean[limit + 1];
-            Arrays.fill(sieve, true);
-            sieve[0] = sieve[1] = false;
-            for (int i = 2; (long)i * i <= limit; i++) {
-                if (sieve[i]) {
-                    for (int j = i * i; j <= limit; j += i) sieve[j] = false;
-                }
-            }
-            count = 0; largest = 2;
-            for (int i = 2; i <= limit; i++) {
-                if (sieve[i]) { count++; largest = i; }
-            }
-            rounds++;
-        } while (System.currentTimeMillis() - startMs < MIN_BURN_MS);
-
-        return String.format("%d primes ≤ %,d (largest %,d) × %d rounds",
-                count, limit, largest, rounds);
-    }
-
-    // ── Matrix Multiplication (O(N³)) ────────────────────────────────────────
-
-    private static String matrixMultiplyLooped(int n, long startMs) {
-        Random rng = new Random(42);
+    private static String matrixLoop(int n, long t0) {
+        Random rng = new Random(7);
         int rounds = 0;
         double corner = 0;
-
         do {
             double[][] a = new double[n][n];
             double[][] b = new double[n][n];
             double[][] c = new double[n][n];
-            for (int i = 0; i < n; i++) {
+            for (int i = 0; i < n; i++)
                 for (int j = 0; j < n; j++) {
                     a[i][j] = rng.nextDouble() * 100;
                     b[i][j] = rng.nextDouble() * 100;
                 }
-            }
-            // ikj loop order — cache-friendly
-            for (int i = 0; i < n; i++) {
-                for (int k = 0; k < n; k++) {
-                    for (int j = 0; j < n; j++) {
+            // ikj order — cache-friendly
+            for (int i = 0; i < n; i++)
+                for (int k = 0; k < n; k++)
+                    for (int j = 0; j < n; j++)
                         c[i][j] += a[i][k] * b[k][j];
-                    }
-                }
-            }
             corner = c[0][0];
             rounds++;
-        } while (System.currentTimeMillis() - startMs < MIN_BURN_MS);
-
-        return String.format("%dx%d matrix, C[0][0]=%.1f × %d rounds", n, n, corner, rounds);
+        } while (elapsed(t0) < MIN_BURN_MS);
+        return String.format("%dx%d matrix ×%d rounds, C[0][0]=%.1f", n, n, rounds, corner);
     }
 
-    // ── Array Sort ────────────────────────────────────────────────────────────
+    // ── Prime sieve ───────────────────────────────────────────────────────────
 
-    private static String sortArrayLooped(int size, long startMs) {
-        Random rng = new Random(99);
-        int rounds = 0;
-        int min = 0, max = 0;
+    private static String primeLoop(int limit, long t0) {
+        int rounds = 0, count = 0, largest = 2;
+        do {
+            boolean[] sieve = new boolean[limit + 1];
+            Arrays.fill(sieve, true);
+            sieve[0] = sieve[1] = false;
+            for (int i = 2; (long)i * i <= limit; i++)
+                if (sieve[i])
+                    for (int j = i * i; j <= limit; j += i)
+                        sieve[j] = false;
+            count = 0; largest = 2;
+            for (int i = 2; i <= limit; i++)
+                if (sieve[i]) { count++; largest = i; }
+            rounds++;
+        } while (elapsed(t0) < MIN_BURN_MS);
+        return String.format("%,d primes ≤ %,d (largest %,d) ×%d rounds",
+                count, limit, largest, rounds);
+    }
 
+    // ── Large array sort ──────────────────────────────────────────────────────
+
+    private static String sortLoop(int size, long t0) {
+        Random rng = new Random(13);
+        int rounds = 0, min = 0, max = 0;
         do {
             int[] arr = new int[size];
             for (int i = 0; i < size; i++) arr[i] = rng.nextInt(Integer.MAX_VALUE);
             Arrays.sort(arr);
-            min = arr[0];
-            max = arr[arr.length - 1];
+            min = arr[0]; max = arr[arr.length - 1];
             rounds++;
-        } while (System.currentTimeMillis() - startMs < MIN_BURN_MS);
-
-        return String.format("sorted %,d ints, min=%,d max=%,d × %d rounds",
+        } while (elapsed(t0) < MIN_BURN_MS);
+        return String.format("sorted %,d ints [%,d..%,d] ×%d rounds",
                 size, min, max, rounds);
     }
+
+    private static long elapsed(long t0) { return System.currentTimeMillis() - t0; }
 }

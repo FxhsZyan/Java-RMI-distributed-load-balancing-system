@@ -4,54 +4,39 @@ import java.rmi.RemoteException;
 import java.rmi.server.UnicastRemoteObject;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 /**
  * ═══════════════════════════════════════════════════════════════
- *  NodeImpl — the heart of the distributed load balancing system
+ *  NodeImpl — RMI server + load balancer for one physical machine
  * ═══════════════════════════════════════════════════════════════
  *
- * Each node is simultaneously:
- *  • An RMI SERVER   — accepts tasks from generators and other nodes
- *  • A LOAD BALANCER — forwards overflow tasks to the least-loaded peer
+ *  Hardcoded peer IPs come from ClusterConfig — no runtime args.
  *
- * Load balancing logic
- * ────────────────────
- *  • activeTasks / MAX_THREADS = current load (0.0 – 1.0)
- *  • If load ≥ OVERLOAD_THRESHOLD, find the peer with the lowest load
- *  • If that peer is less loaded than us, forward the task to it
- *  • If all peers are equally busy, process locally (no task is dropped)
+ *  Load balancing:
+ *    activeTasks / MAX_THREADS ≥ OVERLOAD_THRESHOLD
+ *      → find least-loaded live peer and forward task there
+ *      → if all peers equally busy, process locally
  *
- * Fault tolerance
- * ───────────────
- *  • Live peer stubs are cached and refreshed every PEER_CACHE_TTL_MS
- *  • Any peer that throws RemoteException is removed from the live list
- *  • Tasks whose forward target dies mid-transfer are processed locally
+ *  Fault tolerance:
+ *    Live-peer stubs are cached and refreshed every PEER_CACHE_TTL_MS.
+ *    Any peer that throws RemoteException is marked offline until
+ *    the next refresh cycle.
+ *
+ *  GUI integration:
+ *    Callers register a logListener (Consumer<String>) so every
+ *    structured log line is also pushed to the Swing text area.
  */
 public class NodeImpl extends UnicastRemoteObject implements NodeInterface {
 
     private static final long serialVersionUID = 1L;
 
-    // ── Tunable constants ─────────────────────────────────────────────────────
-
-    /** Thread pool size — raise this to allow more concurrent tasks. */
-    static final int MAX_THREADS = 6;
-
-    /**
-     * Load fraction (0–1) above which this node is considered overloaded
-     * and will attempt to forward new tasks to a less-busy peer.
-     * 0.67 = 4 of 6 threads busy → start offloading.
-     */
-    private static final double OVERLOAD_THRESHOLD = 0.67;
-
-    /** Milliseconds between live-peer cache refreshes. */
-    private static final long PEER_CACHE_TTL_MS = 4_000;
+    static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
 
     // ── State ─────────────────────────────────────────────────────────────────
-
     private final String          nodeId;
     private final ExecutorService pool;
 
@@ -60,42 +45,57 @@ public class NodeImpl extends UnicastRemoteObject implements NodeInterface {
     private final AtomicInteger forwardedTasks = new AtomicInteger(0);
     private final AtomicInteger receivedTasks  = new AtomicInteger(0);
 
-    private final List<String>        peerAddresses = new ArrayList<>();
-    private final List<NodeInterface> livePeers     = new ArrayList<>();
-    private       long                lastPeerRefresh = 0;
+    // peer address → cached stub (null = offline)
+    private final Map<String, NodeInterface> peerCache = new LinkedHashMap<>();
+    private long lastPeerRefresh = 0;
 
-    private static final DateTimeFormatter TS =
-            DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
+    // Optional GUI log callback
+    private Consumer<String> logListener;
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
     public NodeImpl(String nodeId) throws RemoteException {
         super();
         this.nodeId = nodeId;
-        this.pool   = Executors.newFixedThreadPool(MAX_THREADS, r -> {
-            Thread t = new Thread(r, nodeId + "-Worker");
-            t.setDaemon(true);
-            return t;
-        });
-        log("STARTED", "thread pool size=" + MAX_THREADS
-                + "  overload threshold=" + (int)(OVERLOAD_THRESHOLD * 100) + "%");
+        this.pool   = Executors.newFixedThreadPool(
+                ClusterConfig.MAX_THREADS, r -> {
+                    Thread t = new Thread(r, nodeId + "-Worker");
+                    t.setDaemon(true);
+                    return t;
+                });
+
+        // Pre-populate peer cache with nulls (will be resolved on first use)
+        for (String addr : ClusterConfig.allAddresses()) {
+            String name = addrToName(addr);
+            if (!name.equals(nodeId)) {        // skip self
+                peerCache.put(addr, null);
+            }
+        }
+
+        log("STARTED", "pool=" + ClusterConfig.MAX_THREADS
+                + " overload=" + (int)(ClusterConfig.OVERLOAD_THRESHOLD * 100) + "%"
+                + " peers=" + peerCache.keySet());
     }
 
-    // ── NodeInterface ─────────────────────────────────────────────────────────
+    public void setLogListener(Consumer<String> listener) {
+        this.logListener = listener;
+    }
+
+    // ── NodeInterface (called remotely) ───────────────────────────────────────
 
     @Override
     public String submitTask(Task task) throws RemoteException {
         double load = getCurrentLoad();
 
-        // ── Overload check: try to forward before accepting ──────────────────
-        if (load >= OVERLOAD_THRESHOLD) {
-            NodeInterface target = leastLoadedPeer();
+        // ── Try to forward if overloaded ─────────────────────────────────────
+        if (load >= ClusterConfig.OVERLOAD_THRESHOLD) {
+            NodeInterface target = leastLoadedPeer(load);
             if (target != null) {
                 try {
-                    double peerLoad = target.getCurrentLoad();
                     String peerId   = target.getNodeId();
+                    double peerLoad = target.getCurrentLoad();
                     log("OFFLOAD",
-                        String.format("%s  load=%.0f%%→forwarding to %s (load=%.0f%%)",
+                        String.format("%s  myLoad=%.0f%%→%s(%.0f%%)",
                                 task.getTaskId(), load * 100, peerId, peerLoad * 100));
                     forwardedTasks.incrementAndGet();
                     return target.submitTask(task);
@@ -103,53 +103,54 @@ public class NodeImpl extends UnicastRemoteObject implements NodeInterface {
                     log("WARN", "Forward failed, processing locally: " + e.getMessage());
                 }
             } else {
-                log("OVERLOAD",
-                    String.format("%s  load=%.0f%% — all peers busy, processing locally",
+                log("SATURATED",
+                    String.format("%s  load=%.0f%% all peers busy — local fallback",
                             task.getTaskId(), load * 100));
             }
         }
 
-        // ── Accept the task locally ──────────────────────────────────────────
+        // ── Accept locally ────────────────────────────────────────────────────
         boolean wasForwarded = !task.getOriginNodeId().equals(nodeId);
         if (wasForwarded) receivedTasks.incrementAndGet();
 
-        activeTasks.incrementAndGet();
-        int active = activeTasks.get();
+        int slot = activeTasks.incrementAndGet();
         log("ACCEPT",
             String.format("%s  active=%d/%d (%.0f%%)%s",
-                    task, active, MAX_THREADS, (double) active / MAX_THREADS * 100,
-                    wasForwarded ? "  ★RECEIVED FROM " + task.getOriginNodeId() : ""));
+                    task, slot, ClusterConfig.MAX_THREADS,
+                    (double) slot / ClusterConfig.MAX_THREADS * 100,
+                    wasForwarded ? "  ★ rcv-from=" + task.getOriginNodeId() : ""));
 
         try {
-            // Submit to thread pool and block the calling RMI thread
             String result = pool.submit(() -> {
                 try {
                     return TaskProcessor.process(task);
                 } finally {
-                    int remaining = activeTasks.decrementAndGet();
+                    int rem = activeTasks.decrementAndGet();
                     completedTasks.incrementAndGet();
-                    log("COMPLETE",
-                        String.format("%s  active now=%d/%d (%.0f%%)",
-                                task.getTaskId(), remaining, MAX_THREADS,
-                                (double) remaining / MAX_THREADS * 100));
+                    log("DONE", String.format("%s  active=%d/%d (%.0f%%)",
+                            task.getTaskId(), rem, ClusterConfig.MAX_THREADS,
+                            (double) rem / ClusterConfig.MAX_THREADS * 100));
                 }
-            }).get(); // .get() blocks — keeps the RMI call synchronous
+            }).get();
 
             return result;
 
         } catch (ExecutionException | InterruptedException e) {
             activeTasks.decrementAndGet();
-            throw new RemoteException("Task execution failed: " + e.getMessage(), e);
+            throw new RemoteException("Execution failed: " + e.getMessage(), e);
         }
     }
 
     @Override
     public double getCurrentLoad() throws RemoteException {
-        return Math.min(1.0, (double) activeTasks.get() / MAX_THREADS);
+        return Math.min(1.0, (double) activeTasks.get() / ClusterConfig.MAX_THREADS);
     }
 
     @Override
     public String getNodeId() throws RemoteException { return nodeId; }
+
+    /** Local (non-RMI) accessor — avoids try/catch in GUI code. */
+    public String getNodeId(boolean remote) { return nodeId; }
 
     @Override
     public int getActiveTaskCount() throws RemoteException { return activeTasks.get(); }
@@ -159,82 +160,115 @@ public class NodeImpl extends UnicastRemoteObject implements NodeInterface {
 
     @Override
     public NodeStatus getStatus() throws RemoteException {
-        return new NodeStatus(nodeId, getCurrentLoad(),
-                activeTasks.get(), completedTasks.get(),
-                forwardedTasks.get(), receivedTasks.get(), MAX_THREADS);
+        return buildStatus();
     }
 
-    @Override
-    public synchronized void registerPeers(List<String> addresses) throws RemoteException {
-        peerAddresses.clear();
-        peerAddresses.addAll(addresses);
-        livePeers.clear();
-        lastPeerRefresh = 0;
-        log("PEERS", "registered " + addresses.size() + " peer(s): " + addresses);
+    /** Non-RMI local wrapper — used by GUI refresh timer (no try/catch needed). */
+    public NodeStatus getLocalStatus() {
+        return buildStatus();
+    }
+
+    private NodeStatus buildStatus() {
+        double load = Math.min(1.0, (double)activeTasks.get() / ClusterConfig.MAX_THREADS);
+        return new NodeStatus(nodeId, load,
+                activeTasks.get(), completedTasks.get(),
+                forwardedTasks.get(), receivedTasks.get(),
+                ClusterConfig.MAX_THREADS, true);
     }
 
     // ── Load balancing helpers ────────────────────────────────────────────────
 
-    /**
-     * Returns the live peer with the lowest load that is actually less loaded
-     * than this node, or null if no such peer exists.
-     */
-    private synchronized NodeInterface leastLoadedPeer() {
+    private synchronized NodeInterface leastLoadedPeer(double myLoad) {
         long now = System.currentTimeMillis();
-        if (now - lastPeerRefresh > PEER_CACHE_TTL_MS) {
-            refreshLivePeers();
+        if (now - lastPeerRefresh > ClusterConfig.PEER_CACHE_TTL_MS) {
+            refreshPeers();
             lastPeerRefresh = now;
         }
 
         NodeInterface best     = null;
-        double        bestLoad = Double.MAX_VALUE;
+        double        bestLoad = myLoad;  // only forward if strictly less busy
 
-        for (NodeInterface peer : livePeers) {
+        for (Map.Entry<String, NodeInterface> e : peerCache.entrySet()) {
+            NodeInterface peer = e.getValue();
+            if (peer == null) continue;
             try {
+                // Guard: never forward to ourselves in case addrToName()
+                // failed to filter self out during construction.
+                if (nodeId.equals(peer.getNodeId())) { e.setValue(null); continue; }
                 double pl = peer.getCurrentLoad();
                 if (pl < bestLoad) { bestLoad = pl; best = peer; }
-            } catch (RemoteException e) {
-                log("WARN", "Peer unreachable during load query: " + e.getMessage());
+            } catch (RemoteException ex) {
+                log("PEER-DOWN", e.getKey() + " — " + ex.getMessage());
+                e.setValue(null);   // mark offline until next refresh
             }
         }
-
-        try {
-            if (best != null && bestLoad < getCurrentLoad()) return best;
-        } catch (RemoteException ignored) {}
-
-        return null;
+        return best;
     }
 
-    /** Rebuilds livePeers, silently dropping any that don't respond. */
-    private void refreshLivePeers() {
-        livePeers.clear();
-        for (String addr : peerAddresses) {
+    private void refreshPeers() {
+        int live = 0;
+        for (String addr : new ArrayList<>(peerCache.keySet())) {
             try {
                 NodeInterface p = (NodeInterface) java.rmi.Naming.lookup(addr);
-                if (p.isAlive()) livePeers.add(p);
+                p.isAlive();        // confirm it responds
+                peerCache.put(addr, p);
+                live++;
             } catch (Exception e) {
-                log("PEER-DOWN", addr + " — " + e.getMessage());
+                peerCache.put(addr, null);
+                log("PEER-OFFLINE", addr);
             }
         }
-        if (!peerAddresses.isEmpty()) {
-            log("PEERS", "live=" + livePeers.size() + "/" + peerAddresses.size());
+        log("PEERS", "live=" + live + "/" + peerCache.size());
+    }
+
+    // ── Peer status for GUI ───────────────────────────────────────────────────
+
+    /**
+     * Returns a NodeStatus for each peer (online or offline placeholder).
+     * Called by the GUI refresh timer.
+     */
+    public synchronized List<NodeStatus> getPeerStatuses() {
+        List<NodeStatus> list = new ArrayList<>();
+        for (Map.Entry<String, NodeInterface> e : peerCache.entrySet()) {
+            String name = addrToName(e.getKey());
+            if (e.getValue() != null) {
+                try {
+                    list.add(e.getValue().getStatus());
+                    continue;
+                } catch (RemoteException ex) {
+                    e.setValue(null);
+                }
+            }
+            list.add(NodeStatus.offline(name));
         }
+        return list;
     }
 
     // ── Shutdown ──────────────────────────────────────────────────────────────
 
     public void shutdown() {
         pool.shutdownNow();
-        log("STOPPED", "completed=" + completedTasks.get()
-                + "  forwarded=" + forwardedTasks.get()
-                + "  received=" + receivedTasks.get());
+        log("STOPPED", "done=" + completedTasks + " fwd=" + forwardedTasks
+                + " rcv=" + receivedTasks);
     }
 
     // ── Logging ───────────────────────────────────────────────────────────────
 
-    /** Structured, timestamped log line for easy console reading. */
-    void log(String event, String detail) {
-        System.out.printf("[%s] %-8s %-10s %s%n",
+    public void log(String event, String detail) {
+        String line = String.format("[%s] %-8s  %-10s  %s",
                 LocalTime.now().format(TS), nodeId, event, detail);
+        System.out.println(line);
+        if (logListener != null) logListener.accept(line);
+    }
+
+    // ── Utility ───────────────────────────────────────────────────────────────
+
+    private static String addrToName(String addr) {
+        String[] names = ClusterConfig.allNames();
+        String[] addrs = ClusterConfig.allAddresses();
+        for (int i = 0; i < addrs.length; i++)
+            if (addrs[i].equals(addr)) return names[i];
+        return addr;
     }
 }
+// appended

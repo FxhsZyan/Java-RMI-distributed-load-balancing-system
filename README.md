@@ -1,159 +1,144 @@
-# Distributed Load Balancer — Java RMI
-### Apache NetBeans Setup & Run Instructions
+# Distributed Load Balancer — Java RMI + Swing GUI
+### 3-Machine Setup with Hardcoded IPs
 
 ---
 
-## Project Structure
+## Network Configuration (fixed — edit `ClusterConfig.java` to change)
 
+| Node   | IP Address   | RMI Port |
+|--------|--------------|----------|
+| Node-1 | 10.16.45.42  | 1099     |
+| Node-2 | 10.16.45.43  | 1099     |
+| Node-3 | 10.16.45.44  | 1099     |
+
+---
+
+## File Summary
+
+| File                 | Purpose |
+|----------------------|---------|
+| `ClusterConfig.java` | **All hardcoded IPs, ports, and tuning constants** — edit here only |
+| `NodeInterface.java` | RMI remote interface |
+| `Task.java`          | Serialisable work unit |
+| `NodeStatus.java`    | Serialisable status snapshot |
+| `TaskProcessor.java` | Heavy CPU workloads (matrix 1200–1800, sort 10–20M, primes 10–50M) |
+| `NodeImpl.java`      | RMI server + load balancer + peer discovery |
+| `TaskGenerator.java` | 3 sender threads per node, 300ms interval |
+| `NodeGUI.java`       | Java Swing real-time dashboard |
+| `NodeLauncher.java`  | Main class — auto-detects node identity from IP |
+
+---
+
+## How to Run (3 separate machines)
+
+### Step 1 — Copy the JAR to every machine
 ```
-DistributedLoadBalancer/
-├── src/
-│   └── loadbalancer/
-│       ├── NodeInterface.java    ← RMI remote interface (the "contract")
-│       ├── NodeImpl.java         ← Node implementation (server + balancer)
-│       ├── NodeStatus.java       ← Serializable status snapshot
-│       ├── Task.java             ← Serializable task object
-│       ├── TaskProcessor.java    ← CPU-intensive computation engine
-│       ├── TaskGenerator.java    ← Continuous task producer
-│       ├── Monitor.java          ← Live console dashboard
-│       ├── NodeLauncher.java     ← MAIN: start N nodes locally
-│       └── SingleNodeMain.java   ← MAIN: start one node per machine (LAN)
-├── build/                        ← compiled .class files
-└── dist/
-    └── DistributedLoadBalancer.jar
+DistributedLoadBalancer.jar  → copy to the same folder on all 3 machines
 ```
 
----
-
-## How to Import into Apache NetBeans
-
-1. **File → New Project → Java with Ant → Java Application**
-2. Name it `DistributedLoadBalancer`, uncheck "Create Main Class"
-3. Right-click `Source Packages` → **New → Java Package** → `loadbalancer`
-4. Copy all `.java` files from `src/loadbalancer/` into the new package
-5. **Right-click project → Properties → Run** and set:
-   - Main Class: `loadbalancer.NodeLauncher`
-6. Press **F6** (or Run → Run Project)
-
----
-
-## Option A — Run All Nodes on One Machine (Easiest)
-
+### Step 2 — Open firewall port 1099 (TCP) on all machines
 ```bash
-# Default: 3 nodes on ports 1100, 1101, 1102
-java -jar dist/DistributedLoadBalancer.jar
+# Linux
+sudo ufw allow 1099/tcp
 
-# Custom node count (e.g. 5 nodes)
-java -jar dist/DistributedLoadBalancer.jar 5
+# Windows (run as Administrator)
+netsh advfirewall firewall add rule name="RMI-LB" ^
+    dir=in action=allow protocol=TCP localport=1099
 ```
 
-Or in NetBeans: set Run → Arguments to `3` (or any number), then press F6.
+### Step 3 — Run on each machine
+
+**Machine A (10.16.45.42 — Node-1):**
+```bash
+java -Djava.rmi.server.hostname=10.16.45.42 -jar DistributedLoadBalancer.jar
+```
+
+**Machine B (10.16.45.43 — Node-2):**
+```bash
+java -Djava.rmi.server.hostname=10.16.45.43 -jar DistributedLoadBalancer.jar
+```
+
+**Machine C (10.16.45.44 — Node-3):**
+```bash
+java -Djava.rmi.server.hostname=10.16.45.44 -jar DistributedLoadBalancer.jar
+```
+
+> Start them in any order. Nodes that can't reach peers at startup will
+> automatically reconnect every 8 seconds.
 
 ---
 
-## Option B — Run One Node Per Machine (LAN Simulation)
+## How to Run in Apache NetBeans
 
-Use `SingleNodeMain` when each physical machine runs its own JVM.
-
-### Machine A (IP: 192.168.1.10)
-```bash
-java -cp DistributedLoadBalancer.jar loadbalancer.SingleNodeMain \
-     Node-1 1100 \
-     rmi://192.168.1.11:1101/Node-2 \
-     rmi://192.168.1.12:1102/Node-3
-```
-
-### Machine B (IP: 192.168.1.11)
-```bash
-java -cp DistributedLoadBalancer.jar loadbalancer.SingleNodeMain \
-     Node-2 1101 \
-     rmi://192.168.1.10:1100/Node-1 \
-     rmi://192.168.1.12:1102/Node-3
-```
-
-### Machine C (IP: 192.168.1.12)
-```bash
-java -cp DistributedLoadBalancer.jar loadbalancer.SingleNodeMain \
-     Node-3 1102 \
-     rmi://192.168.1.10:1100/Node-1 \
-     rmi://192.168.1.11:1101/Node-2
-```
-
-> **Tip:** Start nodes in any order. Unreachable peers are retried every 5 s.
+1. **File → New Project → Java with Ant → Java Application**, uncheck "Create Main Class"
+2. Create package `loadbalancer`, add all `.java` files
+3. **Right-click project → Properties:**
+   - **Run → Main Class:** `loadbalancer.NodeLauncher`
+   - **Run → VM Options:** `-Djava.rmi.server.hostname=10.16.45.42`
+     *(change IP for each machine)*
+4. Press **F6**
 
 ---
 
-## How the System Works
+## Local Testing (1 machine, loopback aliases)
 
-### 1. Startup
-- Each node creates its own RMI Registry on a unique port.
-- Nodes bind themselves under `rmi://host:port/NodeId`.
-- Peers exchange address lists so every node knows every other node.
+If you don't have 3 physical machines, create loopback aliases so each
+"node" binds to a distinct IP:
 
-### 2. Task Submission
-- `TaskGenerator` creates tasks at random intervals (0.5 – 2 s) and submits
-  them to a randomly chosen node via RMI.
-
-### 3. Dynamic Load Balancing
-- When a node receives a task it checks `activeTasks / MAX_THREADS`.
-- If load ≥ 75%, it queries all live peers and forwards to the least-loaded one.
-- If all peers are also busy, it queues the task locally (no task is dropped).
-
-### 4. Fault Tolerance
-- Nodes maintain a cache of live peer stubs, refreshed every 5 s.
-- Any peer that throws `RemoteException` is excluded from forwarding until
-  the next refresh cycle.
-- Task generators remove dead nodes from their target list automatically.
-
-### 5. Console Dashboard (every 5 s)
+**Windows (run 3 separate CMD windows as Administrator):**
+```cmd
+netsh interface ip add address "Loopback Pseudo-Interface 1" 10.16.45.42 255.255.255.0
+netsh interface ip add address "Loopback Pseudo-Interface 1" 10.16.45.43 255.255.255.0
+netsh interface ip add address "Loopback Pseudo-Interface 1" 10.16.45.44 255.255.255.0
 ```
-══════════════════════════════════════════════════
-  Cluster Status  [12:34:56]
-══════════════════════════════════════════════════
-  Node-1   | load= 75% | active= 3 | done= 42 | fwd= 5  [████████░░]
-  Node-2   | load= 25% | active= 1 | done= 38 | fwd= 2  [███░░░░░░░]
-  Node-3   | load=  0% | active= 0 | done= 31 | fwd= 0  [░░░░░░░░░░]
-══════════════════════════════════════════════════
+Then open 3 terminals and start each node as above.
+
+**Linux:**
+```bash
+sudo ip addr add 10.16.45.42/24 dev lo
+sudo ip addr add 10.16.45.43/24 dev lo
+sudo ip addr add 10.16.45.44/24 dev lo
 ```
 
 ---
 
-## Configurable Constants (edit in source)
+## Tuning (`ClusterConfig.java`)
 
-| File              | Constant             | Default | Description                        |
-|-------------------|----------------------|---------|------------------------------------|
-| `NodeImpl`        | `MAX_THREADS`        | 4       | Thread pool size per node          |
-| `NodeImpl`        | `OVERLOAD_THRESHOLD` | 0.75    | Load fraction to trigger forwarding|
-| `NodeImpl`        | `PEER_CACHE_TTL_MS`  | 5000    | Peer liveness cache interval (ms)  |
-| `NodeLauncher`    | `BASE_PORT`          | 1100    | First port (increments per node)   |
-| `TaskGenerator`   | `MIN_DELAY_MS`       | 500     | Min interval between tasks         |
-| `TaskGenerator`   | `MAX_DELAY_MS`       | 2000    | Max interval between tasks         |
-| `Monitor`         | `INTERVAL_SECONDS`   | 5       | Dashboard refresh rate             |
+| Constant             | Default | Effect |
+|----------------------|---------|--------|
+| `MAX_THREADS`        | 6       | Max concurrent tasks per node |
+| `OVERLOAD_THRESHOLD` | 0.70    | Load % to trigger forwarding (70%) |
+| `PEER_CACHE_TTL_MS`  | 5000    | Peer liveness cache interval |
+| `MIN_BURN_MS`        | 1500    | Minimum CPU time per task |
 
 ---
 
-## Task Types
+## Expected Console Output
 
-| Type              | Parameter       | Computation                              |
-|-------------------|-----------------|------------------------------------------|
-| `PRIME_SEARCH`    | upper bound     | Sieve of Eratosthenes up to N            |
-| `MATRIX_MULTIPLY` | matrix size N   | Two N×N random matrix multiply (O(N³))   |
-| `SORT_ARRAY`      | array size      | Sort N random integers (dual-pivot QS)   |
-
----
-
-## Firewall Notes (for real LAN deployments)
-
-Open the RMI registry ports (default 1100–1102) on each machine:
-```bash
-# Linux / macOS
-sudo ufw allow 1100:1105/tcp
-
-# Windows
-netsh advfirewall firewall add rule name="RMI" dir=in action=allow protocol=TCP localport=1100-1105
+```
+[08:12:34.123] Node-1   STARTED    pool=6 overload=70% peers=[rmi://10.16.45.43:1099/Node-2, ...]
+[08:12:35.441] Node-1   ACCEPT     Task[A1B2C3D4|MATRIX_MULTIPLY|1450|Node-1]  active=1/6 (17%)
+[08:12:36.002] Node-1   ACCEPT     Task[E5F6G7H8|SORT_ARRAY|15000000|Node-1]  active=2/6 (33%)
+...
+[08:12:38.771] Node-1   OFFLOAD    A9B0C1D2  myLoad=83%→Node-2(17%)
+[08:12:38.772] Node-2   ACCEPT     Task[A9B0C1D2|...]  active=1/6 (17%)  ★ rcv-from=Node-1
 ```
 
-Also set the hostname property so RMI advertises the correct IP:
-```bash
-java -Djava.rmi.server.hostname=192.168.1.10 -cp ... loadbalancer.SingleNodeMain ...
+## GUI Layout
+
+```
+╔══════════════════════════════════════════════════════════════╗
+║  Node-1                    Java RMI · 10.16.45.42     ● RUNNING ║
+╠═══════════════════════╦══════════════════════════════════════╣
+║  THIS NODE (Node-1)   ║  PEER: Node-2                        ║
+║  [████████░░]  75%    ║  ● ONLINE  [███░░░░░░░]  30%         ║
+║  Active: 4/6          ║  Active: 2/6   Completed: 38         ║
+║  Completed: 52        ╠══════════════════════════════════════╣
+║  Forwarded: 8         ║  PEER: Node-3                        ║
+║  Received: 3          ║  ● ONLINE  [░░░░░░░░░░]   0%         ║
+╠═══════════════════════╩══════════════════════════════════════╣
+║  TASK LOG                                          [Clear]   ║
+║  [08:12:38] Node-1  OFFLOAD  A9B0C1D2 83%→Node-2(17%)       ║
+║  [08:12:38] Node-1  DONE     E5F6G7H8  active=3/6 (50%)     ║
+╚══════════════════════════════════════════════════════════════╝
 ```

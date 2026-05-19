@@ -2,32 +2,27 @@ package loadbalancer;
 
 import java.rmi.Remote;
 import java.rmi.RemoteException;
-import java.util.List;
 
 /**
- * RMI Remote Interface — the network contract every node must fulfil.
- * Any method declared here can be called from another JVM over the network.
+ * RMI Remote Interface — every node exposes these methods over the network.
  */
 public interface NodeInterface extends Remote {
 
-    /** Submit a task for execution. Blocks until the result is ready. */
+    /** Submit a task. Blocks until the task completes and returns a result string. */
     String submitTask(Task task) throws RemoteException;
 
-    /** 0.0 = idle, 1.0 = all threads saturated. */
+    /** Returns load as 0.0 (idle) – 1.0 (all threads saturated). */
     double getCurrentLoad() throws RemoteException;
 
     /** Human-readable node name, e.g. "Node-1". */
     String getNodeId() throws RemoteException;
 
-    /** Number of tasks currently running in the thread pool. */
+    /** Number of tasks currently running. */
     int getActiveTaskCount() throws RemoteException;
 
-    /** Health-check — returns true if the node is alive. */
+    /** Ping — returns true if the node is alive and responsive. */
     boolean isAlive() throws RemoteException;
 
-    /** Full status snapshot (serialised and sent over RMI). */
+    /** Full status snapshot, serialised and sent over RMI. */
     NodeStatus getStatus() throws RemoteException;
-
-    /** Tell this node about its peers so it can forward overflow tasks. */
-    void registerPeers(List<String> peerAddresses) throws RemoteException;
 }

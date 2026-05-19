@@ -1,119 +1,204 @@
 package loadbalancer;
 
+import java.net.*;
 import java.rmi.Naming;
 import java.rmi.registry.LocateRegistry;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.*;
+import javax.swing.*;
 
 /**
  * ═══════════════════════════════════════════════════════════════════
- *  MAIN ENTRY POINT — starts a full local cluster for testing
+ *  NodeLauncher — single main class run on every machine
  * ═══════════════════════════════════════════════════════════════════
  *
- * Run in NetBeans:
- *   Right-click project → Properties → Run → Main Class: loadbalancer.NodeLauncher
- *   Arguments field: 3        (or leave blank for default 3 nodes)
- *   Then press F6.
+ *  HOW TO RUN
+ *  ──────────
+ *  On EVERY machine (no arguments needed):
  *
- * From the command line:
- *   java -jar dist/DistributedLoadBalancer.jar [numNodes]
+ *    java -Djava.rmi.server.hostname=<THIS_MACHINE_IP> \
+ *         -jar DistributedLoadBalancer.jar
  *
- * Ports: BASE_PORT, BASE_PORT+1, … (one per node, no conflicts)
+ *  Replace <THIS_MACHINE_IP> with the machine's actual IP:
+ *    Node-1 machine (10.16.45.42):  -Djava.rmi.server.hostname=10.16.45.42
+ *    Node-2 machine (10.16.45.43):  -Djava.rmi.server.hostname=10.16.45.43
+ *    Node-3 machine (10.16.45.44):  -Djava.rmi.server.hostname=10.16.45.44
  *
- * If you get "Port already in use":
- *   Windows → taskkill /F /IM java.exe
- *   macOS   → killall java
+ *  The launcher auto-detects which node it is by matching its IP
+ *  against the hardcoded IPs in ClusterConfig — no other config needed.
+ *
+ *  FOR LOCAL TESTING (all nodes on one machine):
+ *    Open 3 terminals and run with explicit IP overrides:
+ *      Terminal 1: java -Djava.rmi.server.hostname=10.16.45.42 -jar ...
+ *      (You must have the real IPs or use loopback aliases — see README)
+ *
+ *  NETBEANS:
+ *    Project Properties → Run → VM Options:
+ *      -Djava.rmi.server.hostname=10.16.45.42
  */
 public class NodeLauncher {
 
-    private static final String HOST      = "localhost";
-    private static final int    BASE_PORT = 1100;
-    private static final int    DEFAULT_NODES = 3;
-
     public static void main(String[] args) throws Exception {
 
-        int numNodes = (args.length > 0) ? Integer.parseInt(args[0]) : DEFAULT_NODES;
+        // ── 1. Determine this machine's identity ─────────────────────────────
+        String selfIp = detectSelfIp();
+        System.out.println("[Launcher] Detected IP: " + selfIp);
 
-        banner(numNodes);
+        String nodeId = ClusterConfig.nodeNameForIp(selfIp);
 
-        // ── 1. Boot one RMI registry + NodeImpl per node ─────────────────────
-        List<NodeImpl>      nodeImpls = new ArrayList<>();
-        List<NodeInterface> nodeStubs = new ArrayList<>();
-        List<String>        allAddrs  = new ArrayList<>();
-
-        for (int i = 0; i < numNodes; i++) {
-            int    port   = BASE_PORT + i;
-            String nodeId = "Node-" + (i + 1);
-            String addr   = "rmi://" + HOST + ":" + port + "/" + nodeId;
-
-            // Reuse existing registry if port is already bound (safe restart)
-            try {
-                LocateRegistry.createRegistry(port);
-            } catch (java.rmi.server.ExportException e) {
-                System.out.println("  [warn] Port " + port + " reusing existing registry");
-                LocateRegistry.getRegistry(HOST, port);
+        if (nodeId == null) {
+            // Fallback: allow explicit override via system property or arg
+            if (args.length > 0) {
+                nodeId = args[0]; // e.g.  java ... NodeLauncher Node-1
+            } else {
+                showErrorAndExit("This machine's IP (" + selfIp + ") is not in ClusterConfig.\n"
+                        + "Expected: " + ClusterConfig.IP_NODE1
+                        + ", " + ClusterConfig.IP_NODE2
+                        + ", or " + ClusterConfig.IP_NODE3
+                        + "\n\nSet -Djava.rmi.server.hostname=<IP> and retry.");
+                return;
             }
-
-            NodeImpl node = new NodeImpl(nodeId);
-            Naming.rebind(addr, node);
-            nodeImpls.add(node);
-            allAddrs.add(addr);
-            System.out.println("  ✔  " + nodeId + " bound at " + addr);
         }
 
-        // ── 2. Exchange peer lists ────────────────────────────────────────────
-        for (int i = 0; i < numNodes; i++) {
-            List<String> peers = new ArrayList<>(allAddrs);
-            peers.remove(allAddrs.get(i));
-            nodeImpls.get(i).registerPeers(peers);
+        System.out.println("[Launcher] Starting as: " + nodeId + " (" + selfIp + ")");
+
+        // Instruct RMI to advertise the correct IP (critical for LAN use)
+        System.setProperty("java.rmi.server.hostname", selfIp);
+
+        final String selfAddr = ClusterConfig.addrForIp(selfIp) != null
+                ? ClusterConfig.addrForIp(selfIp)
+                : "rmi://" + selfIp + ":" + ClusterConfig.RMI_PORT + "/" + nodeId;
+
+        // ── 2. Start RMI registry and bind this node ─────────────────────────
+        try {
+            LocateRegistry.createRegistry(ClusterConfig.RMI_PORT);
+        } catch (java.rmi.server.ExportException e) {
+            System.out.println("[Launcher] Registry already running on port "
+                    + ClusterConfig.RMI_PORT + " — reusing.");
+            LocateRegistry.getRegistry(selfIp, ClusterConfig.RMI_PORT);
         }
 
-        // ── 3. Lookup stubs for monitor + generators ──────────────────────────
-        for (String addr : allAddrs) {
-            nodeStubs.add((NodeInterface) Naming.lookup(addr));
+        NodeImpl node = new NodeImpl(nodeId);
+        Naming.rebind(selfAddr, node);
+        System.out.println("[Launcher] Bound at: " + selfAddr);
+
+        // ── 3. Launch Swing GUI (must be on EDT) ─────────────────────────────
+        final String finalSelfIp = selfIp;
+        SwingUtilities.invokeLater(() -> new NodeGUI(node, finalSelfIp));
+
+        // ── 4. Build peer stub list (peers are looked up lazily inside NodeImpl)
+        //       For the task generator we do a best-effort immediate lookup.
+        List<NodeInterface> peerStubs = new ArrayList<>();
+        peerStubs.add(node); // always target self too
+        for (String addr : ClusterConfig.allAddresses()) {
+            if (addr.equals(selfAddr)) continue;
+            try {
+                NodeInterface peer = (NodeInterface) Naming.lookup(addr);
+                peer.isAlive();
+                peerStubs.add(peer);
+                System.out.println("[Launcher] Connected to peer: " + peer.getNodeId());
+            } catch (Exception e) {
+                System.out.println("[Launcher] Peer not yet available: " + addr
+                        + " (will retry in background)");
+            }
         }
 
-        // ── 4. Live dashboard ─────────────────────────────────────────────────
-        Monitor monitor = new Monitor(nodeStubs);
-        monitor.start();
+        // ── 5. Start task generator ───────────────────────────────────────────
+        TaskGenerator gen = new TaskGenerator(nodeId, peerStubs, node);
+        gen.start();
 
-        // ── 5. Task generators — one per node, targeting all nodes ────────────
-        // Multiple generators + multiple sender threads per generator = high load
-        List<TaskGenerator> generators = new ArrayList<>();
-        for (int i = 0; i < numNodes; i++) {
-            TaskGenerator gen = new TaskGenerator("G" + (i + 1),
-                    new ArrayList<>(nodeStubs));
-            gen.start();
-            generators.add(gen);
-        }
+        // ── 6. Background peer re-connection loop ─────────────────────────────
+        // Keeps trying to add peers that were offline at startup
+        final List<NodeInterface> stubs = peerStubs;
+        Thread reconnect = new Thread(() -> {
+            while (!Thread.currentThread().isInterrupted()) {
+                try { Thread.sleep(8_000); } catch (InterruptedException e) { break; }
+                for (String addr : ClusterConfig.allAddresses()) {
+                    if (addr.equals(selfAddr)) continue;
+                    boolean alreadyHave = false;
+                    synchronized (stubs) {
+                        for (NodeInterface s : stubs) {
+                            try {
+                                if (s.getNodeId().equals(addrToName(addr))) {
+                                    alreadyHave = true; break;
+                                }
+                            } catch (Exception ignored) {}
+                        }
+                    }
+                    if (!alreadyHave) {
+                        try {
+                            NodeInterface peer = (NodeInterface) Naming.lookup(addr);
+                            peer.isAlive();
+                            synchronized (stubs) { stubs.add(peer); }
+                            System.out.println("[Reconnect] Added peer: " + addr);
+                        } catch (Exception ignored) {}
+                    }
+                }
+            }
+        }, "Reconnect");
+        reconnect.setDaemon(true);
+        reconnect.start();
 
-        // ── 6. Shutdown hook: unbind RMI names → ports freed immediately ──────
-        final List<String> boundAddrs = new ArrayList<>(allAddrs);
+        // ── 7. Shutdown hook ──────────────────────────────────────────────────
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("\n[Launcher] Shutting down…");
-            generators.forEach(TaskGenerator::stop);
-            monitor.stop();
-            nodeImpls.forEach(NodeImpl::shutdown);
-            boundAddrs.forEach(addr -> {
-                try { Naming.unbind(addr); } catch (Exception ignored) {}
-            });
-            System.out.println("[Launcher] Clean shutdown complete. Ports are free.");
+            System.out.println("[Launcher] Shutting down…");
+            gen.stop();
+            node.shutdown();
+            try { Naming.unbind(selfAddr); }
+            catch (Exception ignored) {}
+            System.out.println("[Launcher] Done.");
         }));
 
-        System.out.println();
-        System.out.println("  Cluster running. Watch the logs. Press Ctrl+C to stop.");
-        System.out.println();
-
-        Thread.currentThread().join();
+        System.out.println("[Launcher] " + nodeId + " is running. Close the window to stop.");
     }
 
-    private static void banner(int n) {
-        System.out.println();
-        System.out.println("╔══════════════════════════════════════════════════════╗");
-        System.out.println("║   Distributed Load Balancer  ·  Java RMI             ║");
-        System.out.println("║   Nodes: " + n + "  ·  Threads/node: " + NodeImpl.MAX_THREADS
-                + "  ·  Overload @ 67%              ║");
-        System.out.println("╚══════════════════════════════════════════════════════╝");
-        System.out.println();
+    // ── IP detection ──────────────────────────────────────────────────────────
+
+    /**
+     * Returns the first non-loopback IPv4 address that matches one of the
+     * cluster IPs, or falls back to the first site-local address found.
+     */
+    private static String detectSelfIp() {
+        // Check java.rmi.server.hostname first (set via -D flag)
+        String prop = System.getProperty("java.rmi.server.hostname");
+        if (prop != null && !prop.isBlank()) return prop.trim();
+
+        try {
+            Enumeration<NetworkInterface> ifaces = NetworkInterface.getNetworkInterfaces();
+            List<String> candidates = new ArrayList<>();
+            while (ifaces.hasMoreElements()) {
+                NetworkInterface iface = ifaces.nextElement();
+                if (!iface.isUp() || iface.isLoopback()) continue;
+                Enumeration<InetAddress> addrs = iface.getInetAddresses();
+                while (addrs.hasMoreElements()) {
+                    InetAddress addr = addrs.nextElement();
+                    if (addr instanceof Inet4Address && !addr.isLoopbackAddress()) {
+                        String ip = addr.getHostAddress();
+                        // Prefer known cluster IPs
+                        if (ip.equals(ClusterConfig.IP_NODE1) ||
+                            ip.equals(ClusterConfig.IP_NODE2) ||
+                            ip.equals(ClusterConfig.IP_NODE3)) return ip;
+                        candidates.add(ip);
+                    }
+                }
+            }
+            if (!candidates.isEmpty()) return candidates.get(0);
+        } catch (SocketException ignored) {}
+
+        return "127.0.0.1";
+    }
+
+    private static String addrToName(String addr) {
+        String[] names = ClusterConfig.allNames();
+        String[] addrs = ClusterConfig.allAddresses();
+        for (int i = 0; i < addrs.length; i++)
+            if (addrs[i].equals(addr)) return names[i];
+        return addr;
+    }
+
+    private static void showErrorAndExit(String msg) {
+        System.err.println("[ERROR] " + msg);
+        JOptionPane.showMessageDialog(null, msg, "Configuration Error",
+                JOptionPane.ERROR_MESSAGE);
+        System.exit(1);
     }
 }

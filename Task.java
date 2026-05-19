@@ -4,17 +4,17 @@ import java.io.Serializable;
 import java.util.UUID;
 
 /**
- * A unit of work sent across the network via RMI.
- * Must be Serializable so Java can marshal it over the wire.
+ * A unit of work passed between nodes over RMI.
+ * Must be Serializable so Java can marshal it across the network.
  */
 public class Task implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
     public enum TaskType {
-        PRIME_SEARCH,      // Sieve of Eratosthenes up to N
-        MATRIX_MULTIPLY,   // Two N×N matrices — O(N³)
-        SORT_ARRAY         // Dual-pivot quicksort on N random integers
+        MATRIX_MULTIPLY,    // N×N matrix multiply — O(N³), N = 1200–1800
+        PRIME_SEARCH,       // Sieve of Eratosthenes up to 10–50 million
+        SORT_ARRAY          // Sort 10–20 million random integers
     }
 
     private final String   taskId;
@@ -39,7 +39,7 @@ public class Task implements Serializable {
 
     @Override
     public String toString() {
-        return String.format("Task[%s|%s|param=%,d|from=%s]",
+        return String.format("Task[%s|%s|%,d|%s]",
                 taskId, type, parameter, originNodeId);
     }
 }

@@ -1,121 +1,99 @@
 package loadbalancer;
 
 import java.rmi.RemoteException;
-import java.time.LocalTime;
-import java.time.format.DateTimeFormatter;
-import java.util.List;
-import java.util.Random;
+import java.util.*;
 import java.util.concurrent.*;
 
 /**
- * Aggressively generates CPU-intensive tasks and submits them to the cluster.
+ * Continuously generates CPU-intensive tasks and submits them to the cluster.
  *
- * Design goals
- * ────────────
- *  • Submission rate is fast enough to keep all node threads busy most of the time,
- *    so load balancing (forwarding) actually happens and is visible in the logs.
- *  • Each generator maintains a small thread pool of its own so multiple tasks
- *    can be in-flight simultaneously (RMI submitTask() is blocking per-call).
- *  • Tasks are weighted toward the HEAVIEST types (matrix multiply, large sort)
- *    so CPU usage is clearly visible in Task Manager / top.
+ * Design:
+ *  - SENDER_THREADS concurrent submission threads per generator
+ *  - Staggered starts so they don't all fire simultaneously
+ *  - Heavy task weights: 40% matrix (largest), 35% sort, 25% prime
+ *  - Fast enough submission rate to reliably trigger load-balancing forwarding
  */
 public class TaskGenerator {
 
-    private static final DateTimeFormatter TS =
-            DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
+    private static final int  SENDER_THREADS  = 3;
+    private static final int  SUBMIT_DELAY_MS = 300;
 
-    /** How many concurrent submission threads this generator uses. */
-    private static final int SENDER_THREADS = 4;
-
-    /** Delay between task submissions per sender thread (ms). Short = more pressure. */
-    private static final int SUBMIT_DELAY_MS = 200;
-
-    private final String                   id;
+    private final String                   genId;
     private final List<NodeInterface>      nodes;
     private final ScheduledExecutorService scheduler;
     private final Random                   rng = new Random();
+    private final NodeImpl                 localNode; // for logging
 
-    public TaskGenerator(String id, List<NodeInterface> nodes) {
-        this.id    = id;
-        this.nodes = nodes;
+    public TaskGenerator(String genId, List<NodeInterface> nodes, NodeImpl localNode) {
+        this.genId     = genId;
+        this.nodes     = nodes;
+        this.localNode = localNode;
         this.scheduler = Executors.newScheduledThreadPool(SENDER_THREADS, r -> {
-            Thread t = new Thread(r, "Gen-" + id + "-Sender");
+            Thread t = new Thread(r, "Gen-" + genId + "-Sender");
             t.setDaemon(true);
             return t;
         });
     }
 
-    /** Starts SENDER_THREADS concurrent submission loops. */
     public void start() {
         for (int i = 0; i < SENDER_THREADS; i++) {
-            final int senderId = i;
-            // Stagger the starts so they don't all fire at the same instant
+            final int sid = i;
             scheduler.scheduleWithFixedDelay(
-                    () -> submitOne(senderId),
-                    senderId * 50L,        // initial delay (stagger)
-                    SUBMIT_DELAY_MS,       // between submissions
+                    () -> submitOne(sid),
+                    sid * 80L,
+                    SUBMIT_DELAY_MS,
                     TimeUnit.MILLISECONDS);
         }
-        log("STARTED", SENDER_THREADS + " sender threads, delay=" + SUBMIT_DELAY_MS + "ms");
+        localNode.log("GEN-START",
+                genId + " — " + SENDER_THREADS + " senders @ " + SUBMIT_DELAY_MS + "ms");
     }
 
-    private void submitOne(int senderId) {
-        if (nodes.isEmpty()) { log("WARN", "No nodes available"); return; }
+    private void submitOne(int sid) {
+        List<NodeInterface> snapshot;
+        synchronized (nodes) { snapshot = new ArrayList<>(nodes); }
+        if (snapshot.isEmpty()) { localNode.log("GEN-WARN", "no nodes"); return; }
 
-        // Pick target node at random — simulates uneven real-world arrival
-        NodeInterface target = nodes.get(rng.nextInt(nodes.size()));
-        Task          task   = randomHeavyTask();
+        NodeInterface target = snapshot.get(rng.nextInt(snapshot.size()));
+        Task          task   = heavyTask();
 
         try {
-            String targetId = target.getNodeId();
-            double tLoad    = target.getCurrentLoad();
-            log("SEND",
-                String.format("[sender-%d] %s → %s (load=%.0f%%)",
-                        senderId, task.getTaskId(), targetId, tLoad * 100));
-
+            String tid = target.getNodeId();
+            double tl  = target.getCurrentLoad();
+            localNode.log("GEN-SEND",
+                    String.format("[s%d] %s → %s (load=%.0f%%)", sid, task.getTaskId(), tid, tl * 100));
             String result = target.submitTask(task);
-            log("RESULT", "[sender-" + senderId + "] " + result);
-
+            localNode.log("GEN-RESULT", "[s" + sid + "] " + result);
         } catch (RemoteException e) {
-            log("ERROR", "Node unreachable, removing: " + e.getMessage());
+            localNode.log("GEN-ERR", "node unreachable, removing: " + e.getMessage());
             synchronized (nodes) { nodes.remove(target); }
         }
     }
 
     /**
-     * Produces a task weighted toward heavy computations.
-     * Weight: 40% matrix, 35% sort, 25% prime — all with large parameters
-     * so MIN_BURN_MS in TaskProcessor is easily exceeded.
+     * Heavy task distribution:
+     *  40% MATRIX_MULTIPLY  N = 1200–1800  (several seconds each)
+     *  35% SORT_ARRAY        10–20 M ints
+     *  25% PRIME_SEARCH      10–50 M limit
      */
-    private Task randomHeavyTask() {
+    private Task heavyTask() {
         int roll = rng.nextInt(100);
         Task.TaskType type;
         int param;
-
         if (roll < 40) {
-            // Matrix multiply N=350–500 → ~200–800 ms per iteration
             type  = Task.TaskType.MATRIX_MULTIPLY;
-            param = 350 + rng.nextInt(150);
+            param = 1200 + rng.nextInt(600);   // 1200–1800
         } else if (roll < 75) {
-            // Sort 5–15 million elements → ~400–1500 ms per iteration
             type  = Task.TaskType.SORT_ARRAY;
-            param = 5_000_000 + rng.nextInt(10_000_000);
+            param = 10_000_000 + rng.nextInt(10_000_000); // 10–20 M
         } else {
-            // Prime sieve up to 3–8 million → ~80–250 ms per iteration
             type  = Task.TaskType.PRIME_SEARCH;
-            param = 3_000_000 + rng.nextInt(5_000_000);
+            param = 10_000_000 + rng.nextInt(40_000_000); // 10–50 M
         }
-
-        return new Task(type, param, id);
+        return new Task(type, param, genId);
     }
 
     public void stop() {
         scheduler.shutdownNow();
-        log("STOPPED", "");
-    }
-
-    private void log(String event, String detail) {
-        System.out.printf("[%s] %-12s %-10s %s%n",
-                LocalTime.now().format(TS), "GEN-" + id, event, detail);
+        localNode.log("GEN-STOP", genId);
     }
 }
